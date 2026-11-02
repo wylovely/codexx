@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codexx"
+dynamic = ["version"]
+description = "A native Codex CLI companion with quota recovery and optional updates"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+dependencies = ["websockets==15.0.1"]
+
+[project.optional-dependencies]
+build = ["pyinstaller==6.22.3", "build>=1.2"]
+
+[project.scripts]
+codexx = "codexx.cli:main"
+
+[tool.setuptools.dynamic]
+version = {attr = "codexx.version.VERSION"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

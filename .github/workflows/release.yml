@@ -1,0 +1,63 @@
+name: Native release builds
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: windows-latest, key: windows-x86_64, binary: codexx.exe}
+          - {os: macos-15-intel, key: macos-x86_64, binary: codexx}
+          - {os: macos-14, key: macos-arm64, binary: codexx}
+          - {os: ubuntu-22.04, key: linux-x86_64, binary: codexx}
+          - {os: ubuntu-22.04-arm, key: linux-arm64, binary: codexx}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - name: Verify platform and release tag
+        env:
+          EXPECTED_PLATFORM: ${{ matrix.key }}
+          PYTHONPATH: src
+        run: python scripts/verify_release.py
+      - run: python -m pip install -e ".[build]"
+      - run: python -m unittest discover -s tests -v
+      - run: python build.py --no-install
+      - name: Smoke test native binary
+        shell: bash
+        run: ./dist/${{ matrix.binary }} --codexx-no-update --codexx-version
+      - run: python scripts/package_release.py
+      - run: python scripts/smoke_install.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.key }}
+          path: release/*
+          if-no-files-found: error
+  publish:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: release
+      - name: Assemble checksums
+        run: cat release/SHA256SUMS-* | tr -d '\r' > release/SHA256SUMS
+      - name: Publish draft with all assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$RELEASE_TAG" --draft --verify-tag --generate-notes release/*.zip release/*.tar.gz release/SHA256SUMS
