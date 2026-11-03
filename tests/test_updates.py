@@ -2,6 +2,9 @@ import hashlib
 import io
 import json
 import os
+import sys
+import threading
+import time
 from pathlib import Path
 import tempfile
 import unittest
@@ -12,6 +15,8 @@ from codexx.cli import main
 from codexx.paths import executable_name
 from codexx.version import VERSION
 
+REAL_SCHEDULE = updates.schedule_background
+
 
 class UpdateTests(unittest.TestCase):
     def setUp(self):
@@ -20,7 +25,10 @@ class UpdateTests(unittest.TestCase):
         self.environment = patch.dict(os.environ, {'CODEXX_HOME': str(self.root), 'CODEXX_REPOSITORY': ''})
         self.environment.start()
         self.output = patch('sys.stdout', new_callable=io.StringIO)
-        self.output.start()
+        self.capture = self.output.start()
+        self.schedule_patch = patch('codexx.updates.schedule_background')
+        self.scheduler = self.schedule_patch.start()
+        self.addCleanup(self.schedule_patch.stop)
 
     def tearDown(self):
         self.output.stop()
@@ -65,13 +73,16 @@ class UpdateTests(unittest.TestCase):
             prompt.assert_not_called()
             install.assert_not_called()
 
-    def test_declining_optional_update_preserves_native_arguments(self):
+    def test_cached_update_does_not_prompt_or_change_native_arguments(self):
         self.configured()
-        with patch('codexx.releases.latest', return_value={'tag_name': 'v99.0.0'}), \
+        installation.write_json(self.root / 'update-check.json',
+            {'repository': 'owner/repo', 'latest_version': 'v99.0.0'})
+        with patch('codexx.releases.latest') as latest, \
                 patch('sys.stdin.isatty', return_value=True), patch('builtins.input', return_value='n'), \
                 patch('codexx.updates.prepare_update') as install:
             self.assertEqual(updates.preflight(['resume', '--last']), (None, ['resume', '--last']))
             install.assert_not_called()
+            latest.assert_not_called()
 
     def test_explicit_yes_schedules_update_and_exits_before_codex(self):
         self.configured()
@@ -86,6 +97,92 @@ class UpdateTests(unittest.TestCase):
         with patch('codexx.releases.latest', side_effect=TimeoutError('offline')), patch('sys.stderr', new_callable=io.StringIO):
             self.assertEqual(updates.preflight(['-h']), (None, ['-h']))
             self.assertEqual(updates.preflight(['--codexx-check-update']), (1, []))
+
+    def test_startup_only_uses_cache_and_never_prompts_or_fetches(self):
+        self.configured()
+        with patch('codexx.releases.latest') as latest, patch('builtins.input') as prompt:
+            self.assertEqual(updates.preflight(['resume', '--last']), (None, ['resume', '--last']))
+            self.assertEqual(self.capture.getvalue(), '')
+            latest.assert_not_called()
+            prompt.assert_not_called()
+        self.scheduler.assert_called_once_with('owner/repo')
+
+    def test_background_result_is_only_announced_on_the_next_start(self):
+        self.configured()
+        self.assertEqual(updates.preflight([]), (None, []))
+        with patch('codexx.releases.latest', return_value={'tag_name': 'v99.0.0'}):
+            updates.check_background('owner/repo', self.root)
+        self.assertEqual(self.capture.getvalue(), '')
+        with patch('builtins.input') as prompt, patch('codexx.updates.prepare_update') as install:
+            updates.preflight(['--version'])
+            self.assertIn('v99.0.0', self.capture.getvalue())
+            self.assertIn('--codexx-update', self.capture.getvalue())
+            prompt.assert_not_called()
+            install.assert_not_called()
+
+    def test_background_timeout_is_silent_and_retains_known_update(self):
+        self.configured()
+        installation.write_json(self.root / 'update-check.json',
+            {'repository': 'owner/repo', 'latest_version': 'v99.0.0', 'checked_at': 12})
+        with patch('codexx.releases.latest', side_effect=TimeoutError('SSL timed out')), \
+                patch('sys.stderr', new_callable=io.StringIO) as errors:
+            updates.check_background('owner/repo', self.root)
+            self.assertEqual(errors.getvalue(), '')
+        value = updates.read_cache('owner/repo', self.root)
+        self.assertEqual(value['latest_version'], 'v99.0.0')
+        self.assertEqual(value['error_type'], 'TimeoutError')
+        self.assertEqual(self.capture.getvalue(), '')
+
+    def test_cache_cannot_announce_another_repository(self):
+        self.configured()
+        installation.write_json(self.root / 'update-check.json',
+            {'repository': 'other/repo', 'latest_version': 'v99.0.0'})
+        updates.preflight([])
+        self.assertEqual(self.capture.getvalue(), '')
+
+    def test_cache_throttles_checks_and_retries_errors_after_five_minutes(self):
+        with patch('codexx.updates.threading.Thread') as thread:
+            installation.write_json(self.root / 'update-check.json',
+                {'repository': 'owner/repo', 'last_attempt_at': time.time()})
+            REAL_SCHEDULE('owner/repo')
+            thread.assert_not_called()
+            installation.write_json(self.root / 'update-check.json',
+                {'repository': 'owner/repo', 'last_attempt_at': time.time() - 301, 'error_type': 'TimeoutError'})
+            REAL_SCHEDULE('owner/repo')
+            self.assertTrue(thread.call_args.kwargs['daemon'])
+            thread.return_value.start.assert_called_once()
+
+    def test_slow_background_request_does_not_block_startup(self):
+        self.configured()
+        entered, proceed = threading.Event(), threading.Event()
+        workers = []
+        def fetch(repo):
+            entered.set()
+            proceed.wait(3)
+            return {'tag_name': 'v99.0.0'}
+        def schedule(repo):
+            workers.append(REAL_SCHEDULE(repo))
+        try:
+            with patch('codexx.releases.latest', side_effect=fetch), \
+                    patch('codexx.updates.schedule_background', side_effect=schedule):
+                self.assertEqual(updates.preflight([]), (None, []))
+                self.assertTrue(entered.wait(1))
+                self.assertEqual(self.capture.getvalue(), '')
+                self.assertFalse((self.root / 'update-check.json').exists())
+                proceed.set()
+                workers[0].join(2)
+                self.assertFalse(workers[0].is_alive())
+        finally:
+            proceed.set()
+            for worker in workers:
+                worker.join(2)
+        self.assertEqual(updates.read_cache('owner/repo', self.root)['latest_version'], 'v99.0.0')
+
+    def test_skip_and_unconfigured_start_never_schedule_checks(self):
+        updates.preflight([])
+        self.configured()
+        updates.preflight(['--codexx-no-update'])
+        self.scheduler.assert_not_called()
 
     def test_up_to_date_release_does_not_prompt(self):
         self.configured()
@@ -122,6 +219,32 @@ class UpdateTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             installation.install(source, directory=self.root, configure_path=False)
         self.assertEqual(target.read_bytes(), b'old')
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows image locking behavior')
+    def test_loaded_windows_executable_can_be_upgraded_without_stopping_it(self):
+        import ctypes
+        from ctypes import wintypes
+        import shutil
+        kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel.LoadLibraryExW.argtypes = [wintypes.LPCWSTR, wintypes.HANDLE, wintypes.DWORD]
+        kernel.LoadLibraryExW.restype = wintypes.HMODULE
+        kernel.FreeLibrary.argtypes = [wintypes.HMODULE]
+        target, source = self.root / 'loaded.exe', self.root / 'new.exe'
+        shutil.copyfile(sys.executable, target)
+        original = target.read_bytes()
+        source.write_bytes(b'new executable')
+        image = kernel.LoadLibraryExW(str(target), None, 1)  # Map only; do not execute code.
+        self.assertTrue(image)
+        try:
+            with self.assertRaises(PermissionError):
+                os.replace(source, target)
+            installation.copy_binary(source, target)
+            self.assertEqual(target.read_bytes(), b'new executable')
+            parked = list(self.root.glob('loaded.exe.in-use-*'))
+            self.assertEqual(len(parked), 1)
+            self.assertEqual(parked[0].read_bytes(), original)
+        finally:
+            kernel.FreeLibrary(image)
 
     def plan(self, digest=None):
         stage = self.root / 'updates' / 'test-stage'

@@ -35,6 +35,9 @@ jobs:
         run: ./dist/${{ matrix.binary }} --codexx-no-update --codexx-version
       - run: python scripts/package_release.py
       - run: python scripts/smoke_install.py
+      - name: Verify Windows bootstrap diagnostics
+        if: runner.os == 'Windows'
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File tests/install_script_smoke.ps1
       - uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.key }}

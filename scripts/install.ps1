@@ -1,4 +1,7 @@
-param([string]$Repository = $env:CODEXX_REPOSITORY)
+param(
+    [string]$Repository = $env:CODEXX_REPOSITORY,
+    [switch]$NoPath
+)
 $ErrorActionPreference = 'Stop'
 if (-not $Repository) {
     Write-Host 'No GitHub repository configured; release installation skipped.'
@@ -13,6 +16,7 @@ $asset = 'codexx-windows-x86_64.zip'
 $baseUrl = "https://github.com/$Repository/releases/latest/download"
 $work = Join-Path ([IO.Path]::GetTempPath()) ('codexx-install-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $work | Out-Null
+$keepWork = $false
 try {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     Invoke-WebRequest -UseBasicParsing -Uri "$baseUrl/SHA256SUMS" -OutFile (Join-Path $work 'SHA256SUMS')
@@ -30,14 +34,39 @@ try {
         $executable = Join-Path $work 'codexx.exe'
         [IO.Compression.ZipFileExtensions]::ExtractToFile($entries[0], $executable)
     } finally { $zip.Dispose() }
-    & $executable --codexx-no-update --codexx-install --codexx-repository $Repository
-    if ($LASTEXITCODE -ne 0) { throw 'Installation failed. Exit running codexx sessions and retry.' }
+    $nativeArguments = @('--codexx-no-update', '--codexx-install', '--codexx-repository', $Repository)
+    if ($NoPath) { $nativeArguments += '--codexx-no-path' }
+    $previousErrorAction = $ErrorActionPreference
+    try {
+        # Windows PowerShell otherwise turns native stderr into a terminating error
+        # before we can preserve the executable's actual failure message.
+        $ErrorActionPreference = 'Continue'
+        $nativeOutput = @(& $executable @nativeArguments 2>&1)
+        $nativeExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorAction
+    }
+    $lines = @($nativeOutput | ForEach-Object { $_.ToString() })
+    $lines | ForEach-Object { Write-Host $_ }
+    $logPath = Join-Path $work 'install.log'
+    [IO.File]::WriteAllLines($logPath, [string[]]$lines, (New-Object Text.UTF8Encoding($false)))
+    if ($nativeExitCode -ne 0) {
+        throw "Installation failed (exit code $nativeExitCode). See the actual error above and log: $logPath"
+    }
+} catch {
+    $keepWork = $true
+    Write-Warning "Installation files retained for diagnosis: $work"
+    throw
 } finally {
     # The target is an explicitly created, resolved child of the system temp directory.
     $resolvedWork = [IO.Path]::GetFullPath($work)
     $resolvedTemp = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\') + '\'
-    if ($resolvedWork.StartsWith($resolvedTemp, [StringComparison]::OrdinalIgnoreCase) -and
+    if (-not $keepWork -and $resolvedWork.StartsWith($resolvedTemp, [StringComparison]::OrdinalIgnoreCase) -and
         [IO.Path]::GetFileName($resolvedWork).StartsWith('codexx-install-')) {
-        Remove-Item -LiteralPath $resolvedWork -Recurse -Force
+        try {
+            Remove-Item -LiteralPath $resolvedWork -Recurse -Force
+        } catch {
+            Write-Warning "Installation completed; temporary files could not be removed: $resolvedWork"
+        }
     }
 }

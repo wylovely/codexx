@@ -1,10 +1,11 @@
-"""Optional startup update checks; run before help, version, recovery or Codex."""
+"""Cached startup notices and quiet background checks; explicit updates stay synchronous."""
 import hashlib
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
+import threading
 import time
 import uuid
 
@@ -12,6 +13,63 @@ from . import releases
 from .installation import copy_binary, install, write_json
 from .paths import executable_name, home
 from .version import DEFAULT_REPOSITORY, RELEASE_PROTOCOL, VERSION
+
+CHECK_INTERVAL = 3600
+ERROR_RETRY_INTERVAL = 300
+
+
+def read_cache(repo, directory):
+    try:
+        path = Path(directory) / 'update-check.json'
+        if path.stat().st_size > 65536:
+            return {}
+        value = json.loads(path.read_text(encoding='utf-8'))
+        return value if isinstance(value, dict) and value.get('repository') == repo else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def check_background(repo, directory):
+    """Never print, prompt, install, or use a different runtime directory mid-check."""
+    value = dict(read_cache(repo, directory), repository=repo, last_attempt_at=time.time())
+    try:
+        release = releases.latest(repo)
+        releases.version(release['tag_name'])
+        value.update(latest_version=release['tag_name'], checked_at=time.time())
+        value.pop('error_type', None)
+    except Exception as exc:
+        value['error_type'] = type(exc).__name__
+    try:
+        write_json(Path(directory) / 'update-check.json', value)
+    except Exception:
+        pass  # A cache or network failure must never disturb the native terminal.
+
+
+def schedule_background(repo):
+    directory = home()
+    cache = read_cache(repo, directory)
+    last = cache.get('last_attempt_at', 0)
+    interval = ERROR_RETRY_INTERVAL if cache.get('error_type') else CHECK_INTERVAL
+    if isinstance(last, (int, float)) and 0 <= time.time() - last < interval:
+        return
+    try:
+        worker = threading.Thread(target=check_background, args=(repo, directory),
+                                  name='codexx-update-check', daemon=True)
+        worker.start()
+        return worker
+    except Exception:
+        pass
+
+
+def cached_notice(repo):
+    value = read_cache(repo, home())
+    try:
+        tag = value['latest_version']
+        if releases.version(tag) > releases.version(VERSION):
+            print('codexx: update available: ' + VERSION + ' -> ' + tag +
+                  '. Run codexx --codexx-update to install.', flush=True)
+    except (KeyError, TypeError, ValueError):
+        pass
 
 
 def options(argv):
@@ -126,6 +184,12 @@ def preflight(argv):
             if explicit:
                 print('codexx: update check skipped (disabled or no repository configured).')
                 return 0, rest
+            return None, rest
+        if not explicit:
+            # Read only the previous check's result. Even an instant background
+            # response must not produce a notice during this invocation's TUI.
+            cached_notice(repo)
+            schedule_background(repo)
             return None, rest
         release = releases.latest(repo)
         if releases.version(release['tag_name']) <= releases.version(VERSION):

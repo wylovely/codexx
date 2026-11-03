@@ -28,6 +28,8 @@ Invoke-WebRequest https://raw.githubusercontent.com/wylovely/codexx/main/scripts
 powershell -ExecutionPolicy Bypass -File .\install-codexx.ps1 -Repository wylovely/codexx
 ```
 
+已有 `codexx` 命令、只需升级程序时，可给上述命令加 `-NoPath`，跳过 PATH 修改。安装失败会显示原始错误并保留 `install.log`，按输出路径查看详情。
+
 **macOS / Linux：**
 
 ```sh
@@ -93,13 +95,15 @@ codexx -v                       # 查看两者版本
 
 ## 更新
 
-上述安装命令会配置更新仓库。启动时先检查更新，发现新版本后由用户选择是否安装；未配置仓库则跳过检查。
+上述安装命令会配置更新仓库。普通启动不会等待网络：启动时按需在后台检查，发现新版本后在下次启动时提示，运行期间不打断会话。正常检查间隔至少一小时，失败后五分钟内不再尝试；未配置仓库则跳过。
 
 ```sh
 codexx --codexx-check-update    # 仅检查更新
 codexx --codexx-update          # 检查并选择更新
 codexx --codexx-no-update       # 本次跳过检查并启动
 ```
+
+手动检查和更新命令会立即联网；只有显式执行更新命令时才询问安装。
 
 旧安装未配置仓库时，先执行一次：
 

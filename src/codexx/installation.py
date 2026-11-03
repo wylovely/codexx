@@ -5,6 +5,7 @@ from pathlib import Path
 import shlex
 import shutil
 import tempfile
+import uuid
 
 from .paths import executable_name, home
 from .version import VERSION
@@ -34,7 +35,28 @@ def copy_binary(source, target):
         os.chmod(stage, 0o755)
         if target.exists():
             shutil.copy2(target, target.with_name(target.name + '.previous'))
-        os.replace(stage, target)
+        try:
+            os.replace(stage, target)
+        except PermissionError:
+            if os.name != 'nt' or not target.is_file():
+                raise
+            # A loaded Windows EXE can reject replacement but still allow a rename.
+            # Preserve that image for running sessions and put the new EXE at its
+            # original path. Never stop any process or discard the previous image.
+            parked = target.with_name(target.name + '.in-use-' + uuid.uuid4().hex)
+            os.rename(target, parked)
+            try:
+                os.replace(stage, target)
+            except BaseException:
+                try:
+                    os.rename(parked, target)
+                except OSError as rollback_error:
+                    raise RuntimeError('Install failed; restore the previous executable from ' + str(parked)) from rollback_error
+                raise
+            try:
+                parked.unlink()
+            except OSError:
+                pass  # The running image remains intact until its session exits.
     finally:
         if os.path.exists(stage):
             os.unlink(stage)
